@@ -1,0 +1,316 @@
+var express = require("express")
+var server = express()
+var bodyParser = require("body-parser")
+var mysql = require("mysql")
+var jwt = require("jsonwebtoken")
+var nano = require("nano-time")
+
+
+server.use(bodyParser.json())
+server.use(bodyParser.urlencoded({extended: true}));
+
+const jwtSecret = "example"
+
+let pool = mysql.createPool({
+    connectionLimit: 100,
+    host: "localhost",
+    user: "root",
+    password: "ThisisallM!",
+    database: "react_chat"
+})
+
+const poolConnectionPromise = () => {    
+    return new Promise((resolve, reject) => {
+        pool.getConnection((err, connection) => {
+            if (err) {
+                console.log(err)
+                reject(err)
+            }
+            else {
+                //console.log("Resolving connection");
+                resolve(connection)
+            }
+        })
+    })
+}
+
+const queryPromise = (connection, query) => {
+    return new Promise((resolve, reject) => {
+        connection.query(query, (err, results, fields) => {
+            if (err) reject(err)
+            else resolve({results, fields})
+        })
+    })
+}
+
+server.all('/*', function(req, res, next) {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Headers", "X-Requested-With");
+    res.header("Access-Control-Allow-Headers", "Content-Type");
+    res.header("Access-Control-Allow-Credentials", "true");
+    next();
+});
+
+server.get("/", (req, res) => {
+	res.send("Server Accessible");
+})
+
+server.post("/register", async (req, res) => {  
+    resBody = {statusCode: 0}  
+    try {
+        let connection = await poolConnectionPromise()        
+        let queryResult  = await queryPromise(connection, `INSERT INTO user(name, username, password) VALUES('${req.body.name}', '${req.body.username}', '${req.body.password}')`)
+        await queryPromise(connection, `CREATE TABLE chat_${queryResult.results.insertId} (uid INT(11) PRIMARY KEY, lastMsg VARCHAR(1000), moment VARCHAR(15), sender INT(1))`)
+        connection.release()        
+        resBody.statusCode = 1
+        resBody.data = queryResult.results.insertId
+        res.send(resBody)
+    } catch(err) {
+        console.log(err)
+        res.send(resBody)
+    }    
+})
+
+server.post("/login", async(req, res) => { 
+    resBody = {statusCode: 0}
+    try {
+        let connection = await poolConnectionPromise()        
+        let queryResult  = await queryPromise(connection, `SELECT * FROM user WHERE username='${req.body.username}' AND password='${req.body.password}'`)                
+        connection.release()
+        if (queryResult.results.length == 1){
+            //form token
+            resBody.token = jwt.sign({
+                userId: queryResult.results[0].id
+            }, jwtSecret, {
+                algorithm: 'HS512', 
+                expiresIn: '30d'
+            })
+            resBody.username = queryResult.results[0].username
+            resBody.name = queryResult.results[0].name
+            resBody.id = queryResult.results[0].id
+            resBody.statusCode = 1
+        } else {
+            resBody.msg = "Incorrect Username or Password"
+        }        
+        res.send(resBody)
+    } catch(err) {
+        console.log(err)
+        res.send(resBody)
+    }    
+})
+
+var x = server.listen(3001, () => {
+    console.log("Server Listening...")
+})
+
+var sio = require('socket.io').listen(x);
+
+var getTableName = (uid1, uid2) => {
+    return "msg"+(uid1>uid2?(`_${uid2}_${uid1}`):(`_${uid1}_${uid2}`))
+}
+
+sio.on("connection", (socket) => {
+    console.log("New client connected: ", socket.id)    
+    //console.log("Sockets: ", sio.sockets.sockets)  
+    
+    socket.emit("start-establish")
+
+    socket.on("establish", async(req, res) => {
+        sio.sockets.sockets[socket.id].uid = req.uid
+
+        //Map User:Socket
+        if (sio.users === undefined) sio.users = {}
+        if (sio.users[req.uid] === undefined) sio.users[req.uid] = []
+        if (sio.users[req.uid]!==undefined && sio.users[req.uid].length>0)
+            sio.sockets.sockets[sio.users[req.uid]].emit("force-disconnect")
+        sio.users[req.uid] = [socket.id]
+
+        //Map Socket:User
+        if (sio.socketMap === undefined) sio.socketMap = {}        
+        sio.socketMap[socket.id] = req.uid
+
+        
+        
+        console.log("User maps: ", sio.users)
+        console.log("Socket maps: ", sio.socketMap)
+        res(true)
+    })
+
+    socket.on("disconnect", () => {
+        //console.log("After disconnect: ", sio.sockets.sockets)
+        //console.log("Disconnected: ", socket.id, "belong to: ", sio.sockets.sockets[socket.id].uid)
+        /* sio.users[req.uid] = sio.users[req.uid].filter(e => e !== socket.id)
+        console.log("User maps: ", sio.users) */
+        if (sio.socketMap === undefined || sio.users === undefined) return
+        targetUid = sio.socketMap[socket.id]        
+        console.log("Disconnected: ", socket.id, "belong to: ", targetUid)
+        delete sio.socketMap[socket.id]
+        if (sio.users[targetUid] === undefined) return
+        sio.users[targetUid] = sio.users[targetUid].filter(e => e !== socket.id)
+        console.log("User maps: ", sio.users)
+        console.log("Socket maps: ", sio.socketMap)
+    })
+    
+    socket.on("get-all-chats", async(req, res) => {
+        //console.log("Pushing all chats")
+        try {
+            let connection = await poolConnectionPromise()
+            //console.log("connected to db")
+            let table = `chat_${req.uid}`
+            let chatResult = await queryPromise(connection, `SELECT ${table}.*, user.name FROM ${table} INNER JOIN user ON user.id=${table}.uid`)
+            res(chatResult.results)
+        } catch(err) {
+            res(undefined)
+            console.log(err)
+        }
+    })
+
+
+    socket.on("publish-friend-request", async(req, res) => {
+        console.log("Event new-chat with data: ", req)        
+        let receiverIdResult, receiverId, connection
+        try {
+            connection = await poolConnectionPromise()
+            receiverIdResult = await queryPromise(connection, `SELECT id FROM user WHERE username='${req.receiver}'`)
+            if (receiverIdResult.results.length === 0) {
+                res({statusCode: 0, msg: "No such user"})            
+                connection.release()
+                return
+            }
+            receiverId = receiverIdResult.results[0].id             
+        } catch(err) {
+            console.log(err)
+            res({statusCode: 0, msg: "Something went wrong"})            
+            connection.release()
+            return
+        }
+        try{
+            let moment = new Date().getTime(), reqId = nano()            
+            await queryPromise(connection, `INSERT INTO friend_request VALUES ('${reqId}', ${req.sender}, ${receiverId}, '${moment}', 0)`)
+            console.log("Finding sockets of uid: ", receiverId)
+            if (sio.users[receiverId] !== undefined){
+                let userResult = await queryPromise(connection, `SELECT name FROM user WHERE id='${req.sender}'`)
+                if (sio.users[receiverId]!==undefined && sio.users[receiverId].length>0)
+                    sio.sockets.sockets[sio.users[receiverId]].emit("new-friend-request", {id: reqId, moment: moment, name: userResult.results[0].name})
+                /* sio.users[receiverId].forEach((socketId, i) => {
+                    sio.sockets.sockets[socketId].emit("new-friend-request", {id: reqId, moment: moment, name: userResult.results[0].name})
+                }) */
+            }                        
+        } catch(err) {
+            console.log(err)
+            res({statusCode: 0, msg: "You've already requested this person"})
+            connection.release()
+            return
+        }         
+        res({statusCode: 1})
+        connection.release()
+    })
+
+
+    socket.on("get-all-friend-requests", async(req, res) => {
+        try {
+            let connection = await poolConnectionPromise()                    
+            let queryResult = await queryPromise(connection, `SELECT friend_request.id as id, friend_request.moment as moment, user.name as name FROM friend_request INNER JOIN user ON friend_request.src=user.id WHERE dest=${req.uid} AND accepted=0`)            
+            res(queryResult.results)
+            connection.release()
+        } catch(err) {
+            res(undefined)
+            console.log(err)
+            connection.release()
+        }        
+    })
+
+    socket.on("accept-friend-request", async(req, res) => {
+        try{
+            console.log("Accepting Friend Request: ", req.reqId)
+            let connection = await poolConnectionPromise()                    
+            let table = "", src = "", dest = "";
+            let qRes = await queryPromise(connection, `SELECT src,dest FROM friend_request WHERE id='${req.reqId}' AND accepted=0`)
+            if (qRes.results.length == 1){
+                src = qRes.results[0].src
+                dest = qRes.results[0].dest
+                table = "msg"+(src>dest?(`_${dest}_${src}`):(`_${src}_${dest}`))
+                console.log("Table name: ", table)
+            }
+            console.log("Src: ", src, "Dest: ", dest)
+            await queryPromise(connection, `UPDATE friend_request SET accepted=1 WHERE id='${req.reqId}'`)
+            await queryPromise(connection, `CREATE TABLE IF NOT EXISTS ${table}(msgId VARCHAR(50) PRIMARY KEY, content VARCHAR(1000), sender INT(11))`)
+            console.log("Inserting into src's chat")
+            await queryPromise(connection, `INSERT INTO chat_${src} VALUES (${dest}, NULL, NULL, NULL)`)
+            console.log("Inserting into dest's chat")
+            await queryPromise(connection, `INSERT INTO chat_${dest} VALUES (${src}, NULL, NULL, NULL)`)            
+            let chatForSrcResult = await queryPromise(connection, 
+                `SELECT 
+                    chat_${src}.*, user.name 
+                FROM 
+                    chat_${src} INNER JOIN user 
+                ON 
+                    user.id=chat_${src}.uid 
+                WHERE 
+                    chat_${src}.uid=${dest}`)
+            console.log("ChatForSRC: ", chatForSrcResult.results[0])
+            if (sio.users[src] !== undefined && sio.users[src].length>0) {
+                console.log("Socket of src: ", sio.users[src]) 
+                sio.sockets.sockets[sio.users[src]].emit("new-chat", chatForSrcResult.results[0])
+            }
+            let chatForDestResult = await queryPromise(connection, 
+                `SELECT 
+                    chat_${dest}.*, user.name 
+                FROM 
+                    chat_${dest} INNER JOIN user 
+                ON 
+                    user.id=chat_${dest}.uid 
+                WHERE 
+                    chat_${dest}.uid=${src}`)
+            console.log("ChatForDEST: ", chatForDestResult.results[0])
+            if (sio.users[dest] !== undefined && sio.users[dest].length>0) {
+                console.log("Socket of dest: ", sio.users[dest]) 
+                sio.sockets.sockets[sio.users[dest]].emit("new-chat", chatForDestResult.results[0])
+            }
+            res({statusCode: 1})
+            connection.release()
+        } catch(err) {            
+            console.log(err)
+            res({statusCode: 0})            
+        }
+    })
+
+    socket.on("load-conversation", async(req, res) => {
+        let connection = await poolConnectionPromise()                    
+        try{
+            let convoRes = await queryPromise(connection, `SELECT * FROM ${getTableName(req.uid, req.targetUid)}`)
+            res({statusCode: 1, conversation: convoRes.results})
+        } catch(err) {
+            console.log(err)
+            res({statusCode: 0})
+        }
+        connection.release()
+    })
+
+    socket.on("send-msg", async(req, res) => {
+        let connection = await poolConnectionPromise()                    
+        try{
+            let msg = {
+                id: nano(),
+                content: req.content,
+                sender: req.uid,
+                to: req.to,
+                moment:  new Date().getTime()              
+            }
+            await queryPromise(connection, `INSERT INTO ${getTableName(req.uid, req.to)} VALUES('${msg.id}', '${msg.content}', ${msg.sender})`)
+            await queryPromise(connection, `INSERT INTO chat_${req.uid} VALUES('${req.to}', '${msg.content}', ${msg.moment}, 1) ON DUPLICATE KEY UPDATE moment=${msg.moment}, lastMsg='${msg.content}', sender=1`)
+            await queryPromise(connection, `INSERT INTO chat_${req.to} VALUES('${req.uid}', '${msg.content}', ${msg.moment}, 0) ON DUPLICATE KEY UPDATE moment=${msg.moment}, lastMsg='${msg.content}', sender=0`)
+            if (sio.users[req.uid] !== undefined && sio.users[req.uid].length>0)
+                sio.sockets.sockets[sio.users[req.uid]].emit("new-msg", {msg});
+            if (sio.users[req.to] !== undefined && sio.users[req.to].length>0)
+                sio.sockets.sockets[sio.users[req.to]].emit("new-msg", {msg});
+            res({statusCode: 1, msg: msg})
+        } catch(err) {
+            console.log(err)
+            res({statusCode: 0})
+        }
+        connection.release()
+    })
+    
+})
+
